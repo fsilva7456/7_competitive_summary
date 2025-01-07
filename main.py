@@ -3,8 +3,8 @@ import logging
 from contextlib import asynccontextmanager
 from openai import OpenAI
 from supabase import create_client, Client
-from typing import List
 from dotenv import load_dotenv
+from typing import Dict, List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -40,61 +40,135 @@ supabase: Client = create_client(
     os.getenv('SUPABASE_KEY')
 )
 
-class BrandRequest(BaseModel):
-    brand_name: str
+class CompetitiveLandscape(BaseModel):
+    competitive_summary: str
+    gaps_opportunities: str
 
-def find_competitors(brand_name: str) -> List[str]:
+class CompetitiveLandscapeResponse(BaseModel):
+    brand_name: str
+    competitive_summary: str
+    gaps_opportunities: str
+
+# [Your existing functions remain unchanged]
+def get_competitors_data(brand_name: str) -> List[Dict]:
     """
-    Use OpenAI to find 5 competitor brands with loyalty programs
+    Get all competitor data for the specified brand
     """
-    logger.info(f"Finding competitors for {brand_name}")
-    prompt = f"""Find 5 major competitors of {brand_name} that have loyalty programs. 
-    Return only the brand names separated by commas, nothing else."""
+    response = supabase.table('competitors').select(
+        'competitor_name, program_summary, competitor_positioning, competitor_rewards_benefits, competitor_user_feedback, competitor_strength, competitor_weakness, competitor_opportunity, competitor_threats'
+    ).eq('brand_name', brand_name).execute()
     
-    response = client.chat.completions.create(
-        model="gpt-4",
+    return response.data
+
+def analyze_competitive_landscape(brand_name: str, competitors_data: List[Dict]) -> CompetitiveLandscape:
+    """
+    Analyze the competitive landscape and identify opportunities
+    """
+    # [Your existing implementation remains unchanged]
+    competitors_overview = ""
+    for comp in competitors_data:
+        competitors_overview += f"""
+        Competitor: {comp.get('competitor_name', 'N/A')}
+        Program Summary: {comp.get('program_summary', 'N/A')}
+        Market Position: {comp.get('competitor_positioning', 'N/A')}
+        Rewards & Benefits: {comp.get('competitor_rewards_benefits', 'N/A')}
+        User Feedback: {comp.get('competitor_user_feedback', 'N/A')}
+        Strengths: {comp.get('competitor_strength', 'N/A')}
+        Weaknesses: {comp.get('competitor_weakness', 'N/A')}
+        Opportunities: {comp.get('competitor_opportunity', 'N/A')}
+        Threats: {comp.get('competitor_threats', 'N/A')}
+        ---
+        """
+
+    prompt = f"""Analyze this competitive landscape data for {brand_name}'s market:
+
+    {competitors_overview}
+
+    Create two comprehensive analyses:
+    1. A summary of the competitive loyalty landscape using the data about the competitors loyalty programs.
+    2. Specific gaps and opportunities that {brand_name} could exploit when designing their loyalty program, be very specific and reference specific examples from the competitor data.
+
+    Consider:
+    - Common strengths and weaknesses across competitors
+    - Unmet customer needs
+    - Market gaps
+    - Innovative opportunities
+    - Potential differentiation strategies"""
+
+    completion = client.beta.chat.completions.parse(
+        model="gpt-4o-2024-11-20",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that provides competitor analysis."},
+            {"role": "system", "content": f"You are a strategic analyst helping {brand_name} design a competitive loyalty program."},
             {"role": "user", "content": prompt}
-        ]
+        ],
+        response_format=CompetitiveLandscape
     )
     
-    competitors = response.choices[0].message.content.strip().split(',')
-    return [comp.strip() for comp in competitors]
+    return completion.choices[0].message.parsed
 
-def insert_competitors(brand_name: str, competitors: List[str]):
+def save_landscape_analysis(brand_name: str, analysis: CompetitiveLandscape):
     """
-    Insert competitors into Supabase table with both brand_name and competitor_name
+    Save the landscape analysis to the competitor_summary table
     """
-    logger.info(f"Inserting competitors for {brand_name}: {competitors}")
-    for competitor in competitors:
-        supabase.table('competitors').insert({
-            'brand_name': brand_name,
-            'competitor_name': competitor
-        }).execute()
+    try:
+        # First, check if an analysis already exists for this brand
+        existing = supabase.table('competitor_summary').select('id').eq('brand_name', brand_name).execute()
+        
+        if existing.data:
+            # Update existing analysis
+            response = supabase.table('competitor_summary').update({
+                'competitive_summary': analysis.competitive_summary,
+                'gaps_opportunities': analysis.gaps_opportunities
+            }).eq('brand_name', brand_name).execute()
+        else:
+            # Create new analysis
+            response = supabase.table('competitor_summary').insert({
+                'brand_name': brand_name,
+                'competitive_summary': analysis.competitive_summary,
+                'gaps_opportunities': analysis.gaps_opportunities
+            }).execute()
+        
+        logger.info(f"Successfully saved landscape analysis for {brand_name}")
+        return response.data[0]
+    except Exception as e:
+        logger.error(f"Error saving analysis: {str(e)}")
+        raise
 
+# FastAPI endpoints
 @app.get("/")
 async def root():
     logger.info("Health check endpoint called")
     return {"status": "API is running"}
 
-@app.post("/analyze-competitors")
-async def analyze_competitors(request: BrandRequest):
+@app.post("/analyze/{brand_name}", response_model=CompetitiveLandscapeResponse)
+async def create_analysis(brand_name: str):
+    """
+    Create and save competitive landscape analysis for a brand
+    """
     try:
-        logger.info(f"Received request to analyze competitors for {request.brand_name}")
-        if not all([os.getenv('OPENAI_API_KEY'), os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY')]):
-            logger.error("Missing environment variables")
-            raise HTTPException(status_code=500, detail="Missing environment variables")
+        logger.info(f"Starting analysis for brand: {brand_name}")
         
-        competitors = find_competitors(request.brand_name)
-        insert_competitors(request.brand_name, competitors)
+        # Get competitor data
+        competitors_data = get_competitors_data(brand_name)
         
-        logger.info(f"Successfully processed request for {request.brand_name}")
-        return {
-            "brand_name": request.brand_name,
-            "competitors": competitors,
-            "status": "Data successfully stored in Supabase"
-        }
+        if not competitors_data:
+            logger.error(f"No competitor data found for {brand_name}")
+            raise HTTPException(status_code=404, detail="No competitor data found")
+        
+        logger.info(f"Found data for {len(competitors_data)} competitors")
+        
+        # Analyze landscape
+        analysis = analyze_competitive_landscape(brand_name, competitors_data)
+        
+        # Save analysis
+        saved_analysis = save_landscape_analysis(brand_name, analysis)
+        
+        return CompetitiveLandscapeResponse(
+            brand_name=brand_name,
+            competitive_summary=analysis.competitive_summary,
+            gaps_opportunities=analysis.gaps_opportunities
+        )
+        
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
